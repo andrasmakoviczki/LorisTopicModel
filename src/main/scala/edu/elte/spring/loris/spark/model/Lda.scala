@@ -5,17 +5,32 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.mllib.linalg.{ Vector, Vectors }
 import org.apache.spark.mllib.clustering.{ EMLDAOptimizer, OnlineLDAOptimizer, DistributedLDAModel, LDA }
 
+import com.typesafe.config.{Config, ConfigFactory}
+import org.apache.spark._
+import scala.util.Try
+import java.util.{Random, Date}
 import scala.collection.mutable
 
-object Lda {
-  def main(args: Array[String]) {
+import spark.jobserver._
 
+object Lda extends SparkJob {
+
+  def main(args: Array[String]) {
     val conf = new SparkConf()
       .setAppName("LDA")
       .setMaster("local")
     val sc = new SparkContext(conf)
+    
+    val config = ConfigFactory.parseString("")
+    val results = runJob(sc, config)
+    println("Result is " + results)
+  }
 
-    import org.apache.spark.rdd.RDD
+  override def validate(sc: SparkContext, config: Config): SparkJobValidation = {
+    SparkJobValid
+  }
+  
+  override def runJob(sc: SparkContext, config: Config): Any = {
 
     val inputPath: String = "text2.txt"
     val stopWordInput: String = "hun_stop.txt"
@@ -66,8 +81,8 @@ object Lda {
     val optimizer = algorithm match {
       case "em" => new EMLDAOptimizer()
       case "online" => new OnlineLDAOptimizer()
-        //mire jó?
-        //.setMiniBatchFraction(0.05)
+      //mire jó?
+      //.setMiniBatchFraction(0.05)
     }
 
     lda.setOptimizer(optimizer).setK(k).setMaxIterations(maxIteration)
@@ -97,16 +112,19 @@ object Lda {
         }
     }
     
-    topics.flatten.sortBy(-_._2).map(_._1).distinct
+    sc.parallelize(topics.flatten.toSeq).groupByKey().map(x => (x._1,x._2.max)).sortBy(-_._2).take(10)
     
-    topics.flatten.sortBy(-_._2).take(10).foreach{
-      case (topic,weight) =>
-        println(s"$topic\t$weight")
-    }
+    //return topics
 
+    //topics.flatten.sortBy(-_._2).map(_._1).distinct
+    
+    /*.foreach {
+      case (topic, weight) =>
+        println(s"$topic\t$weight")
+    }*/
 
     //termPerTopic indexeivel összefűzés
-    topics.zipWithIndex.foreach {
+    /*topics.zipWithIndex.foreach {
       case (topic, i) =>
         println(s"TOPIC $i")
         topic.foreach {
@@ -114,7 +132,7 @@ object Lda {
             println(s"$term\t$weight")
         }
         println
-    }
+    }*/
   }
 
   private def run() {
