@@ -1,59 +1,108 @@
 package edu.elte.spring.loris.spark.model
 
-import org.apache.spark.{ SparkContext, SparkConf }
-import org.apache.spark.rdd.RDD
-import org.apache.spark.mllib.linalg.{ Vector, Vectors }
-import org.apache.spark.mllib.clustering.{ EMLDAOptimizer, OnlineLDAOptimizer, DistributedLDAModel, LDA }
-
-import com.typesafe.config.{Config, ConfigFactory}
-import org.apache.spark._
-import scala.util.Try
-import java.util.{Random, Date}
 import scala.collection.mutable
+import scala.util.Try
 
-import spark.jobserver._
+import org.apache.spark.SparkConf
+import org.apache.spark.SparkContext
+import org.apache.spark.mllib.clustering.EMLDAOptimizer
+import org.apache.spark.mllib.clustering.LDA
+import org.apache.spark.mllib.clustering.OnlineLDAOptimizer
+import org.apache.spark.mllib.linalg.Vector
+import org.apache.spark.mllib.linalg.Vectors
+import org.apache.spark.rdd.RDD
+import org.apache.spark.rdd.RDD.rddToPairRDDFunctions
+
+import com.codahale.jerkson.Json.generate
+import com.typesafe.config.Config
+import com.typesafe.config.ConfigFactory
+
+import edu.elte.spring.loris.spark.model.Lda.Topic
+import spark.jobserver.SparkJob
+import spark.jobserver.SparkJobValid
+import spark.jobserver.SparkJobValidation
 
 object Lda extends SparkJob {
 
+  case class Topic(topicName: String, topicValue: Double) extends Serializable
+  case class TopicPair(rowId: String, topic: Array[Topic]) extends Serializable
+
   def main(args: Array[String]) {
     val conf = new SparkConf()
-      .setAppName("LDA")
+      .setAppName("LorisLDA")
       .setMaster("local")
     val sc = new SparkContext(conf)
-    
+
     val config = ConfigFactory.parseString("")
     val results = runJob(sc, config)
-    println("Result is " + results)
   }
 
   override def validate(sc: SparkContext, config: Config): SparkJobValidation = {
     SparkJobValid
   }
-  
+
   override def runJob(sc: SparkContext, config: Config): Any = {
+    val feeds = NewFeeds.getFreshFeeds()
 
-    val inputPath: String = "text2.txt"
-    val stopWordInput: String = "hun_stop.txt"
+    val topicList = scala.collection.mutable.ListBuffer.empty[TopicPair]
+    for (f <- feeds) {
+      val topics: Array[Topic] = LDACompute(f, sc, config)
+      val topicPair: TopicPair = TopicPair(f.rowid, topics)
+      topicList += topicPair
+    }
+    return generate(topicList)
+  }
 
-    val k: Int = 10
-    val maxIteration: Int = 10
-    var algorithm: String = "em"
+  private def LDACompute(feed: FeedEntry, sc: SparkContext, config: Config): Array[Topic] = {
 
-    val corpus: RDD[String] = sc.wholeTextFiles(inputPath).map(_._2)
+    val stopWordInput: String = Try(config.getString("input.stopWord")).getOrElse("hun_stop.txt")
+    val minWordLength: Int = Try(config.getInt("input.minWordLength")).getOrElse(3)
+
+    val algorithm: String = Try(config.getString("input.algorithm")).getOrElse("em")
+    val k: Int = Try(config.getInt("input.k")).getOrElse(10)
+    val maxIteration: Int = Try(config.getInt("input.maxIteration")).getOrElse(10)
+
+    val (documents, vocabArray) = preprocess(sc, feed, stopWordInput, minWordLength)
+
+    val lda = new LDA()
+
+    val optimizer = algorithm match {
+      case "em" => new EMLDAOptimizer()
+      case "online" => new OnlineLDAOptimizer()
+    }
+
+    lda.setOptimizer(optimizer).setK(k).setMaxIterations(maxIteration)
+
+    val ldaModel = lda.run(documents)
+
+    val topicIndeces = ldaModel.describeTopics(maxTermsPerTopic = 10)
+
+    val topics = topicIndeces.map {
+      case (terms, termWeights) =>
+        terms.zip(termWeights).map {
+          case (term, weight) =>
+            (vocabArray(term.toInt), weight)
+        }
+    }
+
+    return sc.parallelize(topics.flatten.toSeq)
+      .groupByKey()
+      .map(x => new Topic(x._1, x._2.max))
+      .sortBy(-_.topicValue)
+      .take(10)
+  }
+
+  private def preprocess(sc: SparkContext, feed: FeedEntry, stopWordInput: String, minWordLength: Int): (RDD[(Long, Vector)], Array[String]) = {
+    val corpus: RDD[String] = sc.parallelize(Array(feed.title.concat(" ".concat(feed.content))))
     val stopwordText = sc.textFile(stopWordInput).collect().flatMap(_.stripMargin.split("\\s+")).toSet
 
-    val minWordLength = 3
-
-    //tokenizálás
     val tokenized: RDD[Seq[String]] =
       corpus.map(_.toLowerCase.split("\\s+")).map(_.filter(_.forall(java.lang.Character.isLetter)).filter(!stopwordText.contains(_)).filter(_.length > minWordLength))
 
-    //wordcount: sort
     val wordcount: Array[(String, Long)] =
       tokenized.flatMap(_.map(_ -> 1L)).reduceByKey(_ + _).collect
 
     val fullVocabSize = wordcount.size
-    //méretezhető szótár
 
     val vocabArray: Array[String] =
       wordcount.map(_._1)
@@ -70,72 +119,9 @@ object Lda extends SparkJob {
                 wc(termIndex) = wc.getOrElse(termIndex, 0.0) + 1.0
               }
           }
-          //kulcsok rendezése?
           (id, Vectors.sparse(vocab.size, wc.toSeq))
       }
-
-    //
-    algorithm = "em"
-    val lda = new LDA()
-
-    val optimizer = algorithm match {
-      case "em" => new EMLDAOptimizer()
-      case "online" => new OnlineLDAOptimizer()
-      //mire jó?
-      //.setMiniBatchFraction(0.05)
-    }
-
-    lda.setOptimizer(optimizer).setK(k).setMaxIterations(maxIteration)
-    //mire jó?
-    //.setDocConcentration(docConcentration)
-    //.setTopicConcentration(topicConcentration)
-
-    val ldaModel = lda.run(documents)
-
-    /*
-      if (ldaModel.isInstanceOf[DistributedLDAModel]) {
-      val distLDAModel = ldaModel.asInstanceOf[DistributedLDAModel]
-      val avgLogLikelihood = distLDAModel.logLikelihood / actualCorpusSize.toDouble
-      println(s"\t Training data average log likelihood: $avgLogLikelihood")
-      println()
-    }
-      */
-
-    //Array[(Array[Int], Array[Double])]
-    val topicIndeces = ldaModel.describeTopics(maxTermsPerTopic = 10)
-
-    val topics = topicIndeces.map {
-      case (terms, termWeights) =>
-        terms.zip(termWeights).map {
-          case (term, weight) =>
-            (vocabArray(term.toInt), weight)
-        }
-    }
-    
-    sc.parallelize(topics.flatten.toSeq).groupByKey().map(x => (x._1,x._2.max)).sortBy(-_._2).take(10)
-    
-    //return topics
-
-    //topics.flatten.sortBy(-_._2).map(_._1).distinct
-    
-    /*.foreach {
-      case (topic, weight) =>
-        println(s"$topic\t$weight")
-    }*/
-
-    //termPerTopic indexeivel összefűzés
-    /*topics.zipWithIndex.foreach {
-      case (topic, i) =>
-        println(s"TOPIC $i")
-        topic.foreach {
-          case (term, weight) =>
-            println(s"$term\t$weight")
-        }
-        println
-    }*/
+    return (documents, vocabArray)
   }
 
-  private def run() {
-
-  }
 }
