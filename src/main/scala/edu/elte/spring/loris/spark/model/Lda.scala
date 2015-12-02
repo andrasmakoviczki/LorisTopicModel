@@ -56,8 +56,6 @@ object Lda extends SparkJob {
       val topicPair: TopicPair = TopicPair(f.rowid, topics)
       topicList += topicPair
     }
-    val elapsedSeconds = (System.nanoTime() - start) / 1e9
-    println("elapsed time: " + elapsedSeconds)
 
     //JSON formátum
     return generate(topicList)
