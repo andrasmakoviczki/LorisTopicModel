@@ -21,28 +21,30 @@ import org.apache.hadoop.hbase.util.Bytes
 
 object NewFeeds {
 
-  def getFreshFeeds(): List[FeedEntry] = {
+  def getFreshFeeds(maxSize: Int): List[FeedEntry] = {
+    //Csatlakozás HBase-re
     val config: Configuration = HBaseConfiguration.create()
     val connection: Connection = ConnectionFactory.createConnection(config)
     val admin: Admin = connection.getAdmin()
 
     val feedList = scala.collection.mutable.ListBuffer.empty[FeedEntry]
 
+    //Lekérdezés összeállítása
     val table: Table = connection.getTable(TableName.valueOf("loris:FeedEntry"))
-    
     val s = new Scan()
     s.addColumn(Bytes.toBytes("FeedEntry"), Bytes.toBytes("CONTENT"))
     s.addColumn(Bytes.toBytes("FeedEntry"), Bytes.toBytes("CHANNEL"))
     s.addColumn(Bytes.toBytes("FeedEntry"), Bytes.toBytes("TITLE"))
-    s.addColumn(Bytes.toBytes("FeedEntry"), Bytes.toBytes("LABELED"))
-    
+    s.addColumn(Bytes.toBytes("FeedEntry"), Bytes.toBytes("LABELED"))  
     val filter: Filter = new SingleColumnValueFilter(Bytes.toBytes("FeedEntry"), Bytes.toBytes("LABELED"), CompareFilter.CompareOp.EQUAL,
       new BinaryComparator(Bytes.toBytes(false)))
     s.setFilter(filter)
     val scanner: ResultScanner = table.getScanner(s)
 
+    //Adatok lekérése
     val sIter = scanner.iterator
-    while (sIter.hasNext && feedList.size < 100) {
+    var act : Int = 0
+    while (sIter.hasNext && act < maxSize) {
       val current = sIter.next
       feedList.append(new FeedEntry(
         Bytes.toString(current.getRow), 
@@ -50,8 +52,9 @@ object NewFeeds {
         Bytes.toString(current.getValue(Bytes.toBytes("FeedEntry"), Bytes.toBytes("CONTENT"))),
         Bytes.toString(current.getValue(Bytes.toBytes("FeedEntry"), Bytes.toBytes("CHANNEL"))),
         Bytes.toBoolean(current.getValue(Bytes.toBytes("FeedEntry"), Bytes.toBytes("LABELED")))))
+        act = act + 1
     }
-
+    
     scanner.close()
     connection.close()
     

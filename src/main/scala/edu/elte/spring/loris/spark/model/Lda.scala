@@ -42,18 +42,28 @@ object Lda extends SparkJob {
   }
 
   override def runJob(sc: SparkContext, config: Config): Any = {
-    val feeds = NewFeeds.getFreshFeeds()
+
+    val maxSize: Int = Try(config.getInt("input.maxFeedSize")).getOrElse(100)
+    
+    //Új FeedEntry-k lekérése
+    val feeds = NewFeeds.getFreshFeeds(maxSize)
 
     val topicList = scala.collection.mutable.ListBuffer.empty[TopicPair]
+    
     for (f <- feeds) {
-      val topics: Array[Topic] = LDACompute(f, sc, config)
+      //LDA kiszámítása
+      val topics: Array[Topic] = LDACompute(f, sc,config)
       val topicPair: TopicPair = TopicPair(f.rowid, topics)
       topicList += topicPair
     }
+    val elapsedSeconds = (System.nanoTime() - start) / 1e9
+    println("elapsed time: " + elapsedSeconds)
+
+    //JSON formátum
     return generate(topicList)
   }
 
-  private def LDACompute(feed: FeedEntry, sc: SparkContext, config: Config): Array[Topic] = {
+   def LDACompute(feed: FeedEntry, sc: SparkContext, config: Config): Array[Topic] = {
 
     val stopWordInput: String = Try(config.getString("input.stopWord")).getOrElse("hun_stop.txt")
     val minWordLength: Int = Try(config.getInt("input.minWordLength")).getOrElse(3)
@@ -62,8 +72,13 @@ object Lda extends SparkJob {
     val k: Int = Try(config.getInt("input.k")).getOrElse(10)
     val maxIteration: Int = Try(config.getInt("input.maxIteration")).getOrElse(10)
 
+    //Adatok előkészítése
     val (documents, vocabArray) = preprocess(sc, feed, stopWordInput, minWordLength)
 
+    if (documents == null){
+       return new Array[Topic](0)
+    }
+    
     val lda = new LDA()
 
     val optimizer = algorithm match {
@@ -73,10 +88,11 @@ object Lda extends SparkJob {
 
     lda.setOptimizer(optimizer).setK(k).setMaxIterations(maxIteration)
 
+    //Lda számítás
     val ldaModel = lda.run(documents)
-
     val topicIndeces = ldaModel.describeTopics(maxTermsPerTopic = 10)
 
+    //Sorszámok helyettesítése szavakkal
     val topics = topicIndeces.map {
       case (terms, termWeights) =>
         terms.zip(termWeights).map {
@@ -85,6 +101,7 @@ object Lda extends SparkJob {
         }
     }
 
+    //Legmagasabb pontszámú szavakkal való visszatérés
     return sc.parallelize(topics.flatten.toSeq)
       .groupByKey()
       .map(x => new Topic(x._1, x._2.max))
@@ -92,22 +109,29 @@ object Lda extends SparkJob {
       .take(10)
   }
 
-  private def preprocess(sc: SparkContext, feed: FeedEntry, stopWordInput: String, minWordLength: Int): (RDD[(Long, Vector)], Array[String]) = {
-    val corpus: RDD[String] = sc.parallelize(Array(feed.title.concat(" ".concat(feed.content))))
+   def preprocess(sc: SparkContext, feed: FeedEntry, stopWordInput: String, minWordLength: Int): (RDD[(Long, Vector)], Array[String]) = {
+    val corpus = feed.title.concat(" ".concat(feed.content))
     val stopwordText = sc.textFile(stopWordInput).collect().flatMap(_.stripMargin.split("\\s+")).toSet
 
-    val tokenized: RDD[Seq[String]] =
-      corpus.map(_.toLowerCase.split("\\s+")).map(_.filter(_.forall(java.lang.Character.isLetter)).filter(!stopwordText.contains(_)).filter(_.length > minWordLength))
+    //Tokenizálás és tisztítás
+    val tokenized : RDD[Seq[String]] =  
+    sc.parallelize(Seq(corpus.toLowerCase.split("\\s+").filter(_.forall(java.lang.Character.isLetter)).filter(!stopwordText.contains(_)).filter(_.length > minWordLength)))
+         
+    if (tokenized.collect.flatten.size == 0){
+       return (null,null)
+    }
 
+    //Szótár készítése
     val wordcount: Array[(String, Long)] =
       tokenized.flatMap(_.map(_ -> 1L)).reduceByKey(_ + _).collect
-
     val fullVocabSize = wordcount.size
-
     val vocabArray: Array[String] =
       wordcount.map(_._1)
+    
+    //Szótár indexelése
     val vocab: Map[String, Int] = vocabArray.zipWithIndex.toMap
 
+    //Dokumentum elkészítése
     val documents: RDD[(Long, Vector)] =
       tokenized.zipWithIndex.map {
         case (tokens, id) =>
@@ -119,6 +143,7 @@ object Lda extends SparkJob {
                 wc(termIndex) = wc.getOrElse(termIndex, 0.0) + 1.0
               }
           }
+          //Sorszám, vektor előállítása
           (id, Vectors.sparse(vocab.size, wc.toSeq))
       }
     return (documents, vocabArray)
